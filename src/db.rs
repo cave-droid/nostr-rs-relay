@@ -39,6 +39,27 @@ pub struct SubmittedEvent {
 /// Database file
 pub const DB_FILE: &str = "nostr.db";
 
+/// Accept normal events from whitelisted authors and NIP-17 gift wraps whose
+/// single `p` recipient is whitelisted. Gift wraps intentionally use an
+/// ephemeral signing key, so author-only admission would reject every DM.
+fn is_whitelist_authorized(event: &Event, allowed_pubkeys: &[String]) -> bool {
+    if allowed_pubkeys.contains(&event.pubkey) {
+        return true;
+    }
+    if event.kind != 1059 {
+        return false;
+    }
+
+    let mut recipients = event.tags.iter().filter_map(|tag| match tag.as_slice() {
+        [tag_name, pubkey, ..] if tag_name == "p" => Some(pubkey),
+        _ => None,
+    });
+    match (recipients.next(), recipients.next()) {
+        (Some(recipient), None) => allowed_pubkeys.contains(recipient),
+        _ => false,
+    }
+}
+
 /// Build repo
 /// # Panics
 ///
@@ -206,7 +227,7 @@ pub async fn db_writer(
             if let Some(allowed_addrs) = whitelist {
                 // TODO: incorporate delegated pubkeys
                 // if the event address is not in allowed_addrs.
-                if !allowed_addrs.contains(&event.pubkey) {
+                if !is_whitelist_authorized(&event, allowed_addrs) {
                     debug!(
                         "rejecting event: {}, unauthorized author",
                         event.get_event_id_prefix()
@@ -222,9 +243,9 @@ pub async fn db_writer(
             }
         } else {
             // If the user is on whitelist there is no need to check if the user is admitted or has balance to post
-            if whitelist.is_none()
-                || (whitelist.is_some() && !whitelist.as_ref().unwrap().contains(&event.pubkey))
-            {
+            if whitelist.as_ref().map_or(true, |allowed_addrs| {
+                !is_whitelist_authorized(&event, allowed_addrs)
+            }) {
                 let key = Keys::from_pk_str(&event.pubkey).unwrap();
                 match repo.get_account_balance(&key).await {
                     Ok((user_admitted, balance)) => {
@@ -478,4 +499,71 @@ pub struct QueryResult {
     pub sub_id: String,
     /// Serialized event
     pub event: String,
+}
+
+#[cfg(test)]
+mod whitelist_tests {
+    use super::is_whitelist_authorized;
+    use crate::event::Event;
+
+    fn event(kind: u64, pubkey: &str, tags: Vec<Vec<&str>>) -> Event {
+        Event {
+            id: "0".repeat(64),
+            pubkey: pubkey.to_owned(),
+            delegated_by: None,
+            created_at: 1,
+            kind,
+            tags: tags
+                .into_iter()
+                .map(|tag| tag.into_iter().map(str::to_owned).collect())
+                .collect(),
+            content: String::new(),
+            sig: "0".repeat(128),
+            tagidx: None,
+        }
+    }
+
+    #[test]
+    fn permits_events_signed_by_a_whitelisted_author() {
+        let whitelist = vec!["allowed".to_owned()];
+        assert!(is_whitelist_authorized(
+            &event(1, "allowed", vec![]),
+            &whitelist
+        ));
+    }
+
+    #[test]
+    fn permits_nip17_gift_wrap_for_exactly_one_whitelisted_recipient() {
+        let whitelist = vec!["recipient".to_owned()];
+        assert!(is_whitelist_authorized(
+            &event(1059, "ephemeral", vec![vec!["p", "recipient"]]),
+            &whitelist
+        ));
+    }
+
+    #[test]
+    fn rejects_gift_wrap_for_an_unlisted_or_ambiguous_recipient() {
+        let whitelist = vec!["recipient".to_owned()];
+        assert!(!is_whitelist_authorized(
+            &event(1059, "ephemeral", vec![vec!["p", "stranger"]]),
+            &whitelist
+        ));
+        assert!(!is_whitelist_authorized(
+            &event(
+                1059,
+                "ephemeral",
+                vec![vec!["p", "recipient"], vec!["p", "stranger"]]
+            ),
+            &whitelist
+        ));
+    }
+
+    #[test]
+    fn does_not_extend_recipient_authorization_to_other_event_kinds() {
+        let whitelist = vec!["recipient".to_owned()];
+        assert!(!is_whitelist_authorized(
+            &event(1, "stranger", vec![vec!["p", "recipient"]]),
+            &whitelist
+        ));
+    }
 }
